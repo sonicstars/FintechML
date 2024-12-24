@@ -1,0 +1,138 @@
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import gurobipy
+import cvxopt
+import itertools
+from sklearn.datasets import make_circles
+from sklearn.svm import SVC
+from utils import DataLoader
+from IPython.display import display
+
+cvxopt.solvers.options['show_progress'] = False
+
+# create a toy dataset
+income = [30, 55, 63, 35, 28, 140, 100, 95, 64, 63]
+credit_score = [40, 30, 30, 80, 100, 30, 30, 90, 120, 150]
+label = [0, 0, 0, 0, 0, 1, 1, 1, 1, 1]
+col_names = ['income', 'credit_score', 'label']
+
+# create a 2d numpy array with dim = n x (m + 1)
+data = np.array([income, credit_score, label]).T
+data = pd.DataFrame(data, columns=col_names).astype(float)
+data.head(7)
+
+# get_best_line及plt_res這兩個functions 專為此範例dataset 設計
+def get_best_line(w1, w2, b):
+    x1 = np.linspace(0, 140, 10000)
+    x2 = (b - w1 * x1) / w2
+    
+    # 只取第一象限的部分
+    cond = x2 >= 0
+    return x1[cond], x2[cond]
+
+def plt_res(*args):
+    fig, ax = plt.subplots(figsize=(6, 4))
+    sns.scatterplot(x='income', y='credit_score', data=data,
+                    style='label', markers={0: 'o', 1: 's'},
+                    s=65, ax=ax)
+    # 設定 x, y 要顯示的範圍
+    ax.set_ylim(bottom=0, top=300)
+    ax.set_xlim(left=0)
+
+    # 如果有傳入參數，代表除了畫出點之外，還要畫出 decision boundary
+    if len(args):
+        w1, w2, b = args
+        ax.plot(*get_best_line(w1, w2, b))
+        ax.plot(*get_best_line(w1, w2, b+1), '--')
+        ax.plot(*get_best_line(w1, w2, b-1), '--')
+    plt.show()
+# 畫出圖
+plt_res()
+
+# 假設我們知道最優解，畫出來看看
+w1, w2, b = 0.05405, 0.02162, 5.054
+plt_res(w1, w2, b)
+
+# 設定一個 gurobipy 的優化模型
+def model_setup(data):
+    model = gurobipy.Model()
+
+    # 不顯示優化過程數據
+    model.Params.OutputFlag = 0
+    num_of_params = data.shape[1] # m+1
+
+    # 依據給的 data 來加入參數
+    params_name = ["x{}".format(i) for i in range(1, num_of_params)] + ['b']
+    params = model.addVars(params_name)
+
+    return model, params
+
+model, params = model_setup(data)
+params_name = params.keys()
+
+# 取出 class 1 的 x
+coefs_1 = [dict(zip(params_name[:-1], coef[:-1])) for coef in data.values if coef[-1]]
+model.addConstrs(params.prod(coefs_1[i]) >= params['b']+1 for i in range(len(coefs_1)))
+
+# 取出 class 0 的 x
+coefs_0 = [dict(zip(params_name[:-1], coef[:-1])) for coef in data.values if not coef[-1]]
+model.addConstrs(params.prod(coefs_0[i]) <= params['b']-1 for i in range(len(coefs_0)))
+
+model.setObjective(params['x1']**2 + params['x2']**2, gurobipy.GRB.MINIMIZE)
+model.optimize()
+
+w1, w2, b = (round(v.x, 3) for v in model.getVars())
+print(w1, w2, b)
+plt_res(w1, w2, b)
+
+# hard margin 如何分類以下資料
+data.loc[2-1, 'credit_score'] = 140
+data.loc[8-1, 'income'] = 60
+plt_res()
+
+# 要能容許一些錯誤的存在 => soft margin
+def soft_margin(C, data):
+    model, params = model_setup(data)
+    params_name = params.keys()
+    coefs_1 = [dict(zip(params_name[:-1], coef[:-1])) for coef in data.values if coef[-1]]
+    coefs_0 = [dict(zip(params_name[:-1], coef[:-1])) for coef in data.values if not coef[-1]]
+
+    slack_variables = model.addVars(range(len(data)))
+
+    model.addConstrs(params.prod(coefs_1[i]) >= params['b']+1 - slack_variables[i]
+                     for i in range(len(coefs_1)))
+    model.addConstrs(params.prod(coefs_0[i]) <= params['b']-1 + slack_variables[i+len(coefs_1)]
+                     for i in range(len(coefs_0)))
+    c_part = C * gurobipy.quicksum(slack_variables[i] for i in range(len(slack_variables)))
+    sq_sum = gurobipy.quicksum(params[x]**2 for x in params_name[:-1])
+    model.setObjective(c_part + sq_sum, gurobipy.GRB.MINIMIZE)
+    model.optimize()
+
+    wb = [v.x for v in params.values()]
+    w, b = wb[:-1], wb[-1]
+    predicted_b = data.iloc[:, :-1] @ np.array(w)
+    mis_cls = ((predicted_b - b > 0).astype(int) != data.iloc[:, -1]).sum() / len(data)
+    path_width = 2 / np.sqrt(sum(wn**2 for wn in w))
+    violations = sum([(b+1)-pb if label else pb-(b-1) for pb, label in zip(predicted_b, data.iloc[:, -1]) if b-1 < pb < b+1])
+    info = [wn for wn in w]
+    info.extend([b, mis_cls, path_width, violations, model.ObjVal])
+
+    return tuple(info)
+
+C = [.01, .001, .0005, .0003, .0002]
+cols_name = ['C', 'w1', 'w2', 'b', 'mis_cls', 'path_width', 'violations']
+results = np.concatenate((np.array(C).reshape(-1, 1), np.array([soft_margin(c, data)[:-1] for c in C])), axis=1)
+results = pd.DataFrame(results, columns=cols_name)
+display(results.round(4))
+
+w1, w2, b = results[results['C'] == 0.01][['w1', 'w2', 'b']].values[0]
+plt_res(w1, w2, b)
+
+# 和 sklearn 的 SVC 比較一下 C = 0.01 時的結果，C會差0.5倍
+m = SVC(kernel='linear', C=0.01/2, tol=1e-6).fit(data.iloc[:, :-1], data.iloc[:, -1])
+w1, w2 = m.coef_[0].round(3)
+b = -m.intercept_[0].round(3)
+print(w1, w2, b)
+plt_res(w1, w2, b)
